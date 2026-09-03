@@ -210,6 +210,329 @@ Expected:
 acknowledged: true
 deletedCount: 1
 ```
+**Verifying DELETE oplog entry**
+```javascript
+use local
+
+db.oplog.rs.find({
+  op: "d",
+  ns: "ecommerce.customers",
+  "o._id": ObjectId("6a98a49e3cb05e5d7e3e4a98")
+}).sort({$natural: -1}).limit(1).pretty()
+```
+**Sample DELETE oplog entry**
+```javascript
+[
+  {
+    lsid: {
+      id: UUID('45cd79a4-1493-41f2-b289-0b4c86ca941a'),
+      uid: Binary.createFromBase64('O0CMtIVItQN4IsEOsJdrPL8s7jv5xwh5a/A5Qfvs2A8=', 0)
+    },
+    txnNumber: Long('2'),
+    op: 'd',
+    ns: 'ecommerce.customers',
+    ui: UUID('17c0f898-2e98-4725-a368-cbf576d33b76'),
+    o: { _id: ObjectId('6a98a49e3cb05e5d7e3e4a98') },
+    stmtId: 0,
+    ts: Timestamp({ t: 1788390144, i: 1 }),
+    t: Long('1'),
+    v: Long('2'),
+    wall: ISODate('2026-09-02T23:02:24.380Z'),
+    prevOpTime: { ts: Timestamp({ t: 0, i: 0 }), t: Long('-1') }
+  }
+]
+```
+Meaning:
+- `op: 'd'` → Delete operation
+- `ns` → `ecommerce.customers` collection
+- `o._id` → delete chesina document identifier
+- `ts` → oplog ordering timestamp
+- `wall` → actual wall-clock time: 2026-09-02T23:02:24.380Z
+
+Important PITR point
+Actual production-grade Point-in-Time Recovery generally:
+```
+BASE BACKUP
+    ↓
+Oplog changes continuously capture
+    ↓
+Accidental DELETE
+    ↓
+Restore base backup
+    ↓
+Replay oplog until target timestamp
+    ↓
+STOP BEFORE bad DELETE
+```
+Mana existing database ni mess cheyyakunda, separate database create chesi PITR cheddaam.
+Create a fresh database and run below commands.
+```javascript
+use pitr_lab
+
+db.customers.insertMany([
+  {
+    customerId: "PITR001",
+    name: "Ravi Kumar",
+    email: "pitr.ravi@example.com",
+    balance: 1000,
+    status: "active"
+  },
+  {
+    customerId: "PITR002",
+    name: "Anita Sharma",
+    email: "pitr.anita@example.com",
+    balance: 2000,
+    status: "active"
+  },
+  {
+    customerId: "PITR003",
+    name: "Vikram Reddy",
+    email: "pitr.vikram@example.com",
+    balance: 3000,
+    status: "active"
+  }
+])
+
+exit
+```
+**Take Base backup**
+Create backup directories
+```bash
+sudo mkdir -p /backup/mongodb/pitr
+sudo chown -R mongod:mongod /backup/mongodb/pitr
+```
+Run backup command
+```bash
+sudo -u mongod mongodump \
+  --authenticationDatabase admin \
+  -u admin \
+  --db pitr_lab \
+  --out /backup/mongodb/pitr/base_$(date +%Y%m%d_%H%M%S)
+
+# check the Backup directory
+sudo ls -ltrh /backup/mongodb/pitr/
+```
+Capture current timestamp in local database
+```javascript
+use local
+
+rs0 [direct: primary] local> db.oplog.rs.find().sort({$natural:-1}).limit(1).pretty()
+[
+  {
+    op: 'n',
+    ns: '',
+    o: { msg: 'periodic noop' },
+    ts: Timestamp({ t: 1788445982, i: 1 }),
+    t: Long('2'),
+    v: Long('2'),
+    wall: ISODate('2026-09-03T14:33:02.085Z')
+  }
+```
+**Create a change after backup**
+```javascript
+use pitr_lab
+
+db.customers.updateOne(
+  { customerId: "PITR001" },
+  { $set: { balance: 1500 } }
+)
+```
+**Update oplog entry**
+`mongosh` lo `local` database ki switch ayyi:
+```javascript
+use local
+
+db.oplog.rs.find({
+  op: "u",
+  ns: "pitr_lab.customers",
+  "o2.customerId": "PITR001"
+}).sort({$natural: -1}).limit(1).pretty()
+```
+Verify oplog entry
+```javascript
+use local
+
+rs0 [direct: primary] local> db.oplog.rs.find({
+|   op: "u",
+|   ns: "pitr_lab.customers",
+|   "o2._id": ObjectId("6a9983c5c75ca614cc84ff56")
+| }).sort({$natural: -1}).limit(1).pretty()
+[
+  {
+    lsid: {
+      id: UUID('049bf937-fa61-4ed1-8c97-15479727751b'),
+      uid: Binary.createFromBase64('O0CMtIVItQN4IsEOsJdrPL8s7jv5xwh5a/A5Qfvs2A8=', 0)
+    },
+    txnNumber: Long('1'),
+    op: 'u',
+    ns: 'pitr_lab.customers',
+    ui: UUID('aca25b47-189a-4ea8-a899-a173ed78bf69'),
+    o: { '$v': 2, diff: { u: { balance: 1500 } } },
+    o2: { _id: ObjectId('6a9983c5c75ca614cc84ff56') },
+    stmtId: 0,
+    ts: Timestamp({ t: 1788446161, i: 1 }),
+    t: Long('2'),
+    v: Long('2'),
+    wall: ISODate('2026-09-03T14:36:01.240Z'),
+    prevOpTime: { ts: Timestamp({ t: 0, i: 0 }), t: Long('-1') }
+  }
+]
+```
+**Apply another change**
+```javascript
+use pitr_lab
+
+db.customers.updateOne(
+  { customerId: "PITR002" },
+  { $set: { balance: 2500 } }
+)
+```
+Checking oplog entry
+```javascript
+use local
+
+db.oplog.rs.find({
+  op: "u",
+  ns: "pitr_lab.customers",
+  "o2._id": ObjectId("6a9983c5c75ca614cc84ff57")
+}).sort({$natural: -1}).limit(1).pretty()
+[
+  {
+    lsid: {
+      id: UUID('782f7f8a-c525-4da0-b021-af26bbe6af27'),
+      uid: Binary.createFromBase64('O0CMtIVItQN4IsEOsJdrPL8s7jv5xwh5a/A5Qfvs2A8=', 0)
+    },
+    txnNumber: Long('1'),
+    op: 'u',
+    ns: 'pitr_lab.customers',
+    ui: UUID('aca25b47-189a-4ea8-a899-a173ed78bf69'),
+    o: { '$v': 2, diff: { u: { balance: 2500 } } },
+    o2: { _id: ObjectId('6a9983c5c75ca614cc84ff57') },
+    stmtId: 0,
+    ts: Timestamp({ t: 1788446769, i: 1 }),
+    t: Long('2'),
+    v: Long('2'),
+    wall: ISODate('2026-09-03T14:46:09.968Z'),
+    prevOpTime: { ts: Timestamp({ t: 0, i: 0 }), t: Long('-1') }
+  }
+]
+```
+Insert another document:
+```javascript
+use pitr_lab
+
+db.customers.insertOne({
+  customerId: "PITR004",
+  name: "Suresh Kumar",
+  email: "pitr.suresh@example.com",
+  balance: 4000,
+  status: "active"
+})
+```
+Checking oplog entry
+```javascript
+use local
+
+db.oplog.rs.find({
+  op: "i",
+  ns: "pitr_lab.customers",
+  "o._id": ObjectId("6a99894c565170a9b7c93e48")
+}).sort({$natural: -1}).limit(1).pretty()
+[
+  {
+    lsid: {
+      id: UUID('049bf937-fa61-4ed1-8c97-15479727751b'),
+      uid: Binary.createFromBase64('O0CMtIVItQN4IsEOsJdrPL8s7jv5xwh5a/A5Qfvs2A8=', 0)
+    },
+    txnNumber: Long('2'),
+    op: 'i',
+    ns: 'pitr_lab.customers',
+    ui: UUID('aca25b47-189a-4ea8-a899-a173ed78bf69'),
+    o: {
+      _id: ObjectId('6a99894c565170a9b7c93e48'),
+      customerId: 'PITR004',
+      name: 'Suresh Kumar',
+      email: 'pitr.suresh@example.com',
+      balance: 4000,
+      status: 'active'
+    },
+    o2: { _id: ObjectId('6a99894c565170a9b7c93e48') },
+    stmtId: 0,
+    ts: Timestamp({ t: 1788447052, i: 2 }),
+    t: Long('2'),
+    v: Long('2'),
+    wall: ISODate('2026-09-03T14:50:52.888Z'),
+    prevOpTime: { ts: Timestamp({ t: 0, i: 0 }), t: Long('-1') }
+  }
+]
+```
+**Accidental DELETE**
+```javascript
+use pitr_lab
+
+db.customers.deleteOne({
+  customerId: "PITR004"
+})
+```
+Find oplog DELETE command entry
+```javascript
+rs0 [direct: primary] pitr_lab> use local
+switched to db local
+rs0 [direct: primary] local> db.oplog.rs.find({
+|   op: "d",
+|   ns: "pitr_lab.customers",
+|   "o._id": ObjectId("6a99894c565170a9b7c93e48")
+| }).sort({$natural: -1}).limit(1).pretty()
+[
+  {
+    lsid: {
+      id: UUID('049bf937-fa61-4ed1-8c97-15479727751b'),
+      uid: Binary.createFromBase64('O0CMtIVItQN4IsEOsJdrPL8s7jv5xwh5a/A5Qfvs2A8=', 0)
+    },
+    txnNumber: Long('3'),
+    op: 'd',
+    ns: 'pitr_lab.customers',
+    ui: UUID('aca25b47-189a-4ea8-a899-a173ed78bf69'),
+    o: { _id: ObjectId('6a99894c565170a9b7c93e48') },
+    stmtId: 0,
+    ts: Timestamp({ t: 1788447333, i: 1 }),
+    t: Long('2'),
+    v: Long('2'),
+    wall: ISODate('2026-09-03T14:55:33.059Z'),
+    prevOpTime: { ts: Timestamp({ t: 0, i: 0 }), t: Long('-1') }
+  }
+]
+```
+**Recovery Target**
+Suppose production incident ila jarigindhi:
+| **“14:55:33.059 UTC ki accidental DELETE jarigindi. DELETE ki just mundu unna database state ni recover cheyyali.”**
+Appudu target point roughly:
+```
+14:55:33.059 UTC
+       ↑
+       │
+STOP BEFORE DELETE
+```
+So recovery result lo:
+
+- PITR001 → balance 1500 ✅
+- PITR002 → balance 2500 ✅
+- PITR003 → balance 3000 ✅
+- PITR004 → present ✅
+- DELETE operation → replay cheyyakudadhu ❌
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
