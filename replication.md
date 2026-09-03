@@ -521,9 +521,329 @@ So recovery result lo:
 - PITR004 → present ✅
 - DELETE operation → replay cheyyakudadhu ❌
 
+**Create proper `--oplog` backup
+First, backup directory prepare cheyyali:
+```bash
+sudo mkdir -p /backup/mongodb/pitr/oplog_test
+sudo chown -R mongod:mongod /backup/mongodb/pitr/oplog_test
+```
+Then current `pitr_lab` ki proper oplog-aware dump:
+```bash
+sudo -u mongod mongodump \
+  --authenticationDatabase admin \
+  -u admin \
+  --oplog \
+  --out /backup/mongodb/pitr/oplog_test/full_$(date +%Y%m%d_%H%M%S)
+```
+**Why `--oplog`?
+Normal dump:
+```
+customers.bson
+customers.metadata.json
+```
+`--oplog` dump:
+```
+customers.bson
+customers.metadata.json
+oplog.bson   ← important
+```
+`oplog.bson` dump time lo jarigina writes ni capture chestundi, allowing `mongorestore --oplogReplay` to reproduce those writes during restore.
+
+**Check captured entry in the `oplog.bson` file**
+Run:
+```bash
+sudo -u mongod bsondump \
+  /backup/mongodb/pitr/oplog_test/full_20260903_210657/oplog.bson
+```
+PITR cheyyaali ante
+```
+Base backup
+    +
+continuous oplog history
+    +
+target timestamp
+    ↓
+PITR
+```
+PITR only works if your backup + continuous oplog retention cover the required recovery window.
+
+**Step 1 — New clean PITR database create cheddam**
+`mongosh` lo run cheyyi:
+```javascript
+use pitr_lab2
+//Existing database accidental ga unte clean cheyyadaniki:
+db.dropDatabase()
+
+//Then 3 base documents insert cheyyi:
+db.customers.insertMany([
+  {
+    customerId: "BASE001",
+    name: "Ravi Kumar",
+    balance: 1000,
+    status: "active"
+  },
+  {
+    customerId: "BASE002",
+    name: "Anita Sharma",
+    balance: 2000,
+    status: "active"
+  },
+  {
+    customerId: "BASE003",
+    name: "Vikram Reddy",
+    balance: 3000,
+    status: "active"
+  }
+])
+
+//Then verify:
+db.customers.find().sort({ customerId: 1 }).pretty()
+exit
+```
+**Step 2 — Base backup create cheddam**
+Rocky Linux shell lo:
+```bash
+sudo mkdir -p /backup/mongodb/pitr_lab2
+sudo chown -R mongod:mongod /backup/mongodb/pitr_lab2
+
+# Now base backup:
+sudo -u mongod mongodump \
+  --authenticationDatabase admin \
+  -u admin \
+  --db pitr_lab2 \
+  --out /backup/mongodb/pitr_lab2/base_$(date +%Y%m%d_%H%M%S)
+```
+**Next Step — Backup tarvatha first change**
+Ippudu `mongosh` ki malli connect avvu and:
+```javascript
+use pitr_lab2
+
+//Then first controlled change:
+db.customers.updateOne(
+  { customerId: "BASE001" },
+  { $set: { balance: 1500 } }
+)
+
+//update oplog entry timestamp capture cheddam.
+use local
+
+db.oplog.rs.find({
+  op: "u",
+  ns: "pitr_lab2.customers",
+  "o2._id": ObjectId("6a99c8701687906ad8cd2665")
+}).sort({ $natural: -1 }).limit(1).pretty()
+```
+**Next change — BASE002 update**
+`pitr_lab2` database ki vellandi:
+```javascript
+use pitr_lab2
+
+db.customers.updateOne(
+  { customerId: "BASE002" },
+  { $set: { balance: 2500 } }
+)
+// second update checkpoint
+db.oplog.rs.find({
+  op: "u",
+  ns: "pitr_lab2.customers",
+  "o2._id": ObjectId("6a99c8701687906ad8cd2666")
+}).sort({ $natural: -1 }).limit(1).pretty()
 
 
+//Next: INSERT checkpoint
+use pitr_lab2
 
+db.customers.insertOne({
+  customerId: "BASE004",
+  name: "Suresh Kumar",
+  balance: 4000,
+  status: "active"
+})
+{
+  acknowledged: true,
+  insertedId: ObjectId('6a99cb144f21b8e8ef80fcce')
+}
+
+
+use local
+
+db.oplog.rs.find({
+  op: "i",
+  ns: "pitr_lab2.customers",
+  "o2._id": ObjectId("6a99cb144f21b8e8ef80fcce")
+}).sort({ $natural: -1 }).limit(1).pretty()
+```
+**Now comes the important part — simulate the accident**
+Ippudu `BASE004` ni accidentally delete cheddam.
+`pitr_lab2` database ki switch avvu:
+```javascript
+use pitr_lab2
+
+db.customers.deleteOne({
+  customerId: "BASE004"
+})
+//Expected: deletedCount: 1
+But delete tarvatha immediate ga oplog entry kuda capture cheyyi.
+use local
+
+db.oplog.rs.find({
+  op: "d",
+  ns: "pitr_lab2.customers",
+  "o._id": ObjectId("6a99cb144f21b8e8ef80fcce")
+}).sort({ $natural: -1 }).limit(1).pretty()
+```
+Manaki ippudu live `local.oplog.rs` lo aa changes unnayi. First, aa required oplog window actually available undho verify cheddam.
+`mongosh` lo `local` database lo ee command run cheyyi:
+```javascript
+db.oplog.rs.find({
+  ns: "pitr_lab2.customers",
+  ts: {
+    $gte: Timestamp({ t: 1788463504, i: 1 }),
+    $lte: Timestamp({ t: 1788464186, i: 1 })
+  }
+}).sort({ ts: 1 }).pretty()
+//Expected ga 4 entries ravali
+```
+**One more production-level concept**
+For true arbitrary PITR, MongoDB's backup systems maintain a usable snapshot plus an oplog window and construct a restore point by applying operations up to the requested time. MongoDB Ops Manager, for example, explicitly supports selecting a **Point in Time** and applies oplog operations up to — but not including — the selected time.
+
+**Next step: inspect our current oplog window**
+Before we touch any recovery files, let's check how much oplog history this single-node replica set currently retains.
+In `mongosh`, run:
+```javascript
+use local
+
+db.oplog.rs.stats().maxSize
+
+//Then:
+db.oplog.rs.stats().size
+
+//finally:
+db.oplog.rs.find().sort({$natural: 1}).limit(1).pretty()
+```
+
+**Oplog BSON export**
+`mongosh` lo undi `local` DB lo ee command run cheyyi:
+```javascript
+const fs = require('fs');
+
+const cursor = db.oplog.rs.find({
+  ns: "pitr_lab2.customers",
+  ts: {
+    $gte: Timestamp({ t: 1788465178, i: 1 }),
+    $lte: Timestamp({ t: 1788465383, i: 1 })
+  }
+}).sort({ ts: 1 });
+
+const docs = cursor.toArray();
+
+docs.length
+
+exit
+```
+**4 oplog entries ni BSON file ga export cheyyadam**
+Linux shell lo:
+```bash
+sudo mkdir -p /backup/mongodb/pitr_lab2_final/oplog
+sudo chown -R mongod:mongod /backup/mongodb/pitr_lab2_final/oplog
+
+sudo -u mongod mongodump \
+  --authenticationDatabase admin \
+  -u admin \
+  --db local \
+  --collection oplog.rs \
+  --query '{"ns":"pitr_lab2.customers","ts":{"$gte":{"$timestamp":{"t":1788465178,"i":1}},"$lte":{"$timestamp":{"t":1788465383,"i":1}}}}' \
+  --out /backup/mongodb/pitr_lab2_final/oplog
+```
+
+**Oplog file ni expected location/name ki prepare cheddam**
+First ee commands run cheyyi:
+```bash
+sudo mkdir -p /backup/mongodb/pitr_lab2_final/recovery
+sudo chown -R mongod:mongod /backup/mongodb/pitr_lab2_final/recovery
+
+sudo cp \
+  /backup/mongodb/pitr_lab2_final/oplog/local/oplog.rs.bson \
+  /backup/mongodb/pitr_lab2_final/recovery/oplog.bson
+
+sudo chown mongod:mongod \
+  /backup/mongodb/pitr_lab2_final/recovery/oplog.bson
+
+# Then verify:
+ls -lh /backup/mongodb/pitr_lab2_final/recovery/oplog.bson
+```
+
+#### Separate recovery DB path create cheyyi
+Original MongoDB `27017` ni touch cheyyamu. New temporary MongoDB instance kosam `/data/pitr_recovery` use chestham.
+Run:
+```bash
+sudo mkdir -p /data/pitr_recovery
+sudo chown -R mongod:mongod /data/pitr_recovery
+sudo chmod 700 /data/pitr_recovery
+
+# Then verify:
+ls -ld /data/pitr_recovery
+```
+
+#### Temporary MongoDB instance start cheddam
+Original `27017` instance ni touch cheyyamu. Recovery instance `27018` lo, `/data/pitr_recovery` DB path tho run chestham.
+First directory for log create cheyyi:
+```bash
+sudo mkdir -p /var/log/mongodb/pitr_recovery
+sudo chown -R mongod:mongod /var/log/mongodb/pitr_recovery
+```
+Then temporary `mongod` start cheyyi:
+```bash
+sudo -u mongod mongod \
+  --dbpath /data/pitr_recovery \
+  --port 27018 \
+  --bind_ip 127.0.0.1 \
+  --logpath /var/log/mongodb/pitr_recovery/mongod.log \
+  --fork
+```
+Expected: `child process started successfully, parent exiting`
+Then only this verification run cheyyi:
+```bash
+mongosh --port 27018 --quiet --eval 'db.adminCommand({ ping: 1 })'
+```
+**Baseline backup restore**
+Ippudu mana 21:51:15 baseline full dump ni recovery instance ki restore cheddam.
+Run:
+```bash
+mongorestore \
+  --port 27018 \
+  /backup/mongodb/pitr_lab2_final/full_20260903_215115
+```
+⚠️ `--oplogReplay` ippudu ivvaku. First baseline data restore avvali. Oplog replay next step.
+
+**Baseline state verify cheddam**
+Recovery instance 27018 lo:
+```bash
+mongosh --port 27018 --quiet --eval '
+db = db.getSiblingDB("pitr_lab2");
+db.customers.find(
+  {},
+  {_id:0, customerId:1, balance:1, status:1}
+).sort({customerId:1}).forEach(printjson)
+'
+```
+**Oplog replay with PITR limit 🎯**
+Ippudu mana exported oplog.bson ni replay chestham.
+Target timestamp: `1788465383:1`
+Run:
+So first run only this to inspect the exact syntax/help supported by your Database Tools 100.18.0:
+```bash
+mongorestore --help | grep -A2 -E 'oplogReplay|oplogLimit|oplogFile'
+```
+Actual PITR replay:
+```bash
+mongorestore \
+  --port 27018 \
+  --oplogReplay \
+  --oplogLimit 1788465383:1 \
+  --oplogFile /backup/mongodb/pitr_lab2_final/recovery/oplog.bson
+```
+The important part: `--oplogLimit 1788465383:1`
 
 
 
