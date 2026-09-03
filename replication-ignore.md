@@ -264,6 +264,8 @@ Replay oplog until target timestamp
     ↓
 STOP BEFORE bad DELETE
 ```
+## Ignore below 
+
 Mana existing database ni mess cheyyakunda, separate database create chesi PITR cheddaam.
 Create a fresh database and run below commands.
 ```javascript
