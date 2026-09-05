@@ -84,8 +84,6 @@ timedatectl
 
 ---
 
-# 4. 
-
 # 4. Dedicated MongoDB Data Disk
 
 Added a second 30 GB disk to each VM.
